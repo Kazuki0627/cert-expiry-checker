@@ -1,0 +1,4 @@
+# Optional but recommended: verify certificates against the OS trust store
+# (the way browsers do). Without it, Python's bundled CA store is used and
+# some sites whose root is only available from the OS may fail verification.
+truststore>=0.10

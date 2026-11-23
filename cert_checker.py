@@ -24,13 +24,54 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-__version__ = "0.1.0"
+__version__ = "1.1.0"
+
+try:
+    import truststore as _truststore
+except ImportError:  # optional dependency; see create_verify_context()
+    _truststore = None  # type: ignore[assignment]
+
+
+def create_verify_context() -> ssl.SSLContext:
+    """Return a TLS client context that verifies against a trust store.
+
+    When the optional ``truststore`` package is installed, verification uses
+    the operating system's trust store (via an explicitly constructed
+    ``truststore.SSLContext``; ``inject_into_ssl`` is never used), matching
+    how browsers verify. This fixes sites whose root CA is available to the
+    OS but missing from Python's bundled store (e.g. "SSL.com TLS ECC Root
+    CA 2022" on Windows). Without truststore, falls back to
+    ``ssl.create_default_context()``.
+    """
+    if _truststore is not None:
+        return _truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    return ssl.create_default_context()
 
 RDAP_BASE_URL = "https://rdap.org/domain/"
 DEFAULT_PORT = 443
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_WARN_DAYS = 30
 USER_AGENT = f"cert-expiry-checker/{__version__} (python-urllib)"
+
+# AIA (Authority Information Access) chain completion
+AIA_MAX_INTERMEDIATES = 3
+AIA_MAX_BYTES = 64 * 1024
+AIA_NOTE = "chain completed via AIA"
+
+# OpenSSL X509_V_ERR_* codes that indicate an incomplete chain (not a bad cert).
+_CHAIN_ERROR_CODES = {
+    2,   # X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT
+    19,  # X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN
+    20,  # X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY
+    21,  # X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE
+}
+_CHAIN_ERROR_MESSAGES = (
+    "unable to get local issuer certificate",
+    "unable to get issuer certificate",
+    "unable to verify the first certificate",
+    "self-signed certificate in certificate chain",
+    "self signed certificate in certificate chain",
+)
 
 # Status values
 OK = "OK"
@@ -61,6 +102,7 @@ class CertInfo:
     sans: list[str] = field(default_factory=list)
     verified: bool | None = None
     error: str | None = None
+    note: str | None = None  # informational, e.g. "chain completed via AIA"
 
 
 @dataclass
@@ -209,21 +251,34 @@ def _decode_der_cert(der: bytes) -> dict[str, Any]:
             pass
 
 
-def fetch_peer_cert(host: str, port: int = DEFAULT_PORT,
-                    timeout: float = DEFAULT_TIMEOUT) -> tuple[dict[str, Any], bool, str | None]:
-    """Connect via TLS and return (cert_dict, verified, verify_error).
+def _verify_message(exc: ssl.SSLCertVerificationError) -> str:
+    return exc.verify_message or str(exc)
 
-    First tries a fully verified connection. If verification fails, reconnects
-    without verification to still read the certificate's dates.
+
+def is_chain_error(exc: ssl.SSLCertVerificationError) -> bool:
+    """True if a verification error means "incomplete chain" (AIA may help).
+
+    Hostname mismatch, expiry, a self-signed leaf etc. are NOT chain errors and
+    must never be retried.
     """
-    ctx = ssl.create_default_context()
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-                return ssock.getpeercert(), True, None
-    except ssl.SSLCertVerificationError as exc:
-        verify_error = exc.verify_message or str(exc)
+    code = getattr(exc, "verify_code", None)
+    message = (getattr(exc, "verify_message", None) or str(exc)).lower()
+    if code == 62 or "hostname mismatch" in message:  # X509_V_ERR_HOSTNAME_MISMATCH
+        return False
+    if code in _CHAIN_ERROR_CODES:
+        return True
+    return any(m in message for m in _CHAIN_ERROR_MESSAGES)
 
+
+def _get_verified_cert(host: str, port: int, timeout: float,
+                       ctx: ssl.SSLContext) -> dict[str, Any]:
+    """Verified TLS handshake (hostname checked by ctx); returns getpeercert()."""
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+            return ssock.getpeercert()
+
+
+def _get_unverified_der(host: str, port: int, timeout: float) -> bytes:
     insecure = ssl.create_default_context()
     insecure.check_hostname = False
     insecure.verify_mode = ssl.CERT_NONE
@@ -232,7 +287,158 @@ def fetch_peer_cert(host: str, port: int = DEFAULT_PORT,
             der = ssock.getpeercert(binary_form=True)
     if not der:
         raise RuntimeError("server did not present a certificate")
-    return _decode_der_cert(der), False, verify_error
+    return der
+
+
+def extract_ca_issuers(cert: dict[str, Any] | None) -> list[str]:
+    """Return the http(s) caIssuers URIs from a decoded cert dict (others ignored)."""
+    if not isinstance(cert, dict):
+        return []
+    raw = cert.get("caIssuers") or ()
+    if isinstance(raw, str):
+        raw = (raw,)
+    uris: list[str] = []
+    for uri in raw:
+        if not isinstance(uri, str):
+            continue
+        uri = uri.strip()
+        if uri.lower().startswith(("http://", "https://")) and uri not in uris:
+            uris.append(uri)
+    return uris
+
+
+class _HttpOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only to http/https URLs."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        if not newurl.lower().startswith(("http://", "https://")):
+            raise urllib.error.HTTPError(newurl, code, "refusing non-http(s) redirect",
+                                         headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_aia_url(url: str, timeout: float):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    opener = urllib.request.build_opener(_HttpOnlyRedirectHandler)
+    return opener.open(req, timeout=timeout)
+
+
+def cert_bytes_to_pem(data: bytes) -> str:
+    """Convert a downloaded certificate (PEM or DER) to a normalized PEM string.
+
+    For PEM input only the first CERTIFICATE block is used. Raises ValueError
+    if the data is neither.
+    """
+    if not data:
+        raise ValueError("empty certificate data")
+    begin, end = b"-----BEGIN CERTIFICATE-----", b"-----END CERTIFICATE-----"
+    start = data.find(begin)
+    if start != -1:
+        stop = data.find(end, start)
+        if stop == -1:
+            raise ValueError("truncated PEM certificate")
+        block = data[start:stop + len(end)].decode("ascii")
+        der = ssl.PEM_cert_to_DER_cert(block)  # validates base64
+    else:
+        der = data
+        # DER certificates start with an ASN.1 SEQUENCE tag
+        if der[:1] != b"\x30":
+            raise ValueError("not a DER or PEM certificate")
+    return ssl.DER_cert_to_PEM_cert(der)
+
+
+def download_ca_issuer(url: str, timeout: float = DEFAULT_TIMEOUT,
+                       max_bytes: int = AIA_MAX_BYTES) -> str:
+    """Download a caIssuers certificate and return it as PEM."""
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError(f"unsupported AIA URI scheme: {url!r}")
+    with _open_aia_url(url, timeout) as resp:
+        data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(f"AIA certificate larger than {max_bytes} bytes")
+    return cert_bytes_to_pem(data)
+
+
+def _aia_context(pems: list[str]) -> ssl.SSLContext:
+    """Default verifying context plus the downloaded intermediates.
+
+    VERIFY_X509_PARTIAL_CHAIN (enabled by default since Python 3.13) is cleared so
+    that a downloaded intermediate can never act as a trust anchor by itself: the
+    chain must still end at a root from the system trust store.
+    """
+    ctx = create_verify_context()
+    partial = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+    if partial:
+        ctx.verify_flags &= ~partial
+    ctx.load_verify_locations(cadata="\n".join(pems))
+    return ctx
+
+
+def complete_chain_via_aia(host: str, port: int, timeout: float,
+                           leaf: dict[str, Any]) -> tuple[dict[str, Any] | None, int, str | None]:
+    """Try to verify host by fetching missing intermediates via AIA caIssuers.
+
+    Returns (verified_cert_dict, n_intermediates, None) on success, or
+    (None, 0, error) on failure, where `error` is a more specific verification
+    error seen on retry (e.g. expired / hostname mismatch) or None. Never raises.
+    """
+    pems: list[str] = []
+    tried: set[str] = set()
+    uris = extract_ca_issuers(leaf)
+    try:
+        while uris and len(pems) < AIA_MAX_INTERMEDIATES:
+            pem = decoded = None
+            for uri in uris:
+                if uri in tried:
+                    continue
+                tried.add(uri)
+                try:
+                    pem = download_ca_issuer(uri, timeout)
+                    decoded = _decode_der_cert(ssl.PEM_cert_to_DER_cert(pem))
+                    break
+                except Exception:  # noqa: BLE001 - try next URI
+                    pem = decoded = None
+            if pem is None or decoded is None:
+                return None, 0, None
+            # A self-signed download would become a trust anchor: never load one.
+            if _name_to_dict(decoded.get("subject")) == _name_to_dict(decoded.get("issuer")):
+                return None, 0, None
+            pems.append(pem)
+            try:
+                cert = _get_verified_cert(host, port, timeout, _aia_context(pems))
+                return cert, len(pems), None
+            except ssl.SSLCertVerificationError as exc:
+                if not is_chain_error(exc):
+                    return None, 0, _verify_message(exc)
+            uris = extract_ca_issuers(decoded)
+    except Exception:  # noqa: BLE001 - AIA is best effort
+        return None, 0, None
+    return None, 0, None
+
+
+def fetch_peer_cert(host: str, port: int = DEFAULT_PORT,
+                    timeout: float = DEFAULT_TIMEOUT) -> tuple[Any, ...]:
+    """Connect via TLS and return (cert_dict, verified, verify_error[, note]).
+
+    First tries a fully verified connection. If verification fails, reconnects
+    without verification to still read the certificate's dates. If the failure
+    was due to an incomplete chain, tries to complete it via AIA caIssuers and
+    re-verifies; on success the 4th element is a note describing that.
+    """
+    try:
+        return _get_verified_cert(host, port, timeout, create_verify_context()), True, None
+    except ssl.SSLCertVerificationError as exc:
+        verify_error = _verify_message(exc)
+        chain_error = is_chain_error(exc)
+
+    decoded = _decode_der_cert(_get_unverified_der(host, port, timeout))
+    if chain_error:
+        cert, count, retry_error = complete_chain_via_aia(host, port, timeout, decoded)
+        if cert is not None:
+            return cert, True, None, f"{AIA_NOTE} ({count} intermediate(s) fetched)"
+        if retry_error:
+            verify_error = retry_error
+    return decoded, False, verify_error
 
 
 def check_cert(host: str, port: int = DEFAULT_PORT, warn_days: int = DEFAULT_WARN_DAYS,
@@ -240,7 +446,8 @@ def check_cert(host: str, port: int = DEFAULT_PORT, warn_days: int = DEFAULT_WAR
     """Check the TLS certificate of host:port. Never raises."""
     info = CertInfo()
     try:
-        cert, verified, verify_error = fetch_peer_cert(host, port, timeout)
+        cert, verified, verify_error, *extra = fetch_peer_cert(host, port, timeout)
+        info.note = extra[0] if extra else None
         parsed = parse_peer_cert(cert)
     except Exception as exc:  # noqa: BLE001 - per-domain robustness
         info.status = ERROR
@@ -472,6 +679,8 @@ def format_table(results: list[CheckResult]) -> str:
         notes = []
         if r.cert.error:
             notes.append(f"cert: {r.cert.error}")
+        if r.cert.note:
+            notes.append(f"cert: {r.cert.note}")
         if r.registration.error and r.registration.error != "skipped":
             notes.append(r.registration.error)
         rows.append([

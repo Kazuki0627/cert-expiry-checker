@@ -1,7 +1,8 @@
 # cert-expiry-checker
 
 SSL/TLS 証明書の有効期限と、ドメイン登録の有効期限をまとめてチェックする CLI ツールです。
-Python 標準ライブラリのみで動作し、追加のパッケージインストールは不要です。
+基本は Python 標準ライブラリのみで動作します。任意パッケージ `truststore` を入れると、
+証明書の検証に OS の信頼ストアを使うようになり、ブラウザ並みの検証ができるようになります（推奨）。
 
 ## 何をするツールか
 
@@ -12,6 +13,18 @@ Python 標準ライブラリのみで動作し、追加のパッケージイン�
    - 発行者（Issuer）
    - サブジェクト CN / SAN（Subject Alternative Names）
    - 検証に失敗した証明書（期限切れ・自己署名など）も、検証なしで再接続して期限を読み取り、理由とともに報告します
+   - **AIA による中間証明書の補完**: サーバが中間証明書を送ってこない（チェーンが不完全な）場合、ブラウザと同様に
+     証明書の AIA（Authority Information Access）拡張にある `caIssuers` の URL から中間証明書をダウンロードし、
+     それを加えて**検証付きで再接続**します（ホスト名チェックも通常どおり行います）。
+     - 対象は `unable to get local issuer certificate` / `unable to verify the first certificate` /
+       `self-signed certificate in certificate chain` などチェーン構築の失敗のみです。
+       ホスト名不一致・期限切れ・自己署名のリーフ証明書などは再試行せず、従来どおり報告します。
+     - ダウンロードは `http://` / `https://` の URI のみ、最大 64 KB、タイムアウトは `--timeout` と同じです。DER / PEM の両形式に対応します。
+     - 中間証明書は最大 3 枚までたどります。ダウンロードした証明書はチェーン構築の補助として使うだけで、
+       信頼の起点にはなりません（自己署名の証明書は読み込まず、最終的に OS / Python の信頼ストアのルート証明書まで検証が通る必要があります）。
+     - 補完に成功した場合は `verified: true` として通常どおり期限でステータスを判定し、`note` に
+       `chain completed via AIA (N intermediate(s) fetched)` と表示します（テーブルでは NOTES 列）。
+     - ダウンロードや解析に失敗した場合は元の検証エラーをそのまま報告します（期限は表示されます）。
 2. **ドメイン登録の有効期限**（RDAP）
    - `https://rdap.org/domain/<domain>` に問い合わせ（リダイレクトは `urllib` が自動で追従）
    - レスポンスの `events` から `eventAction: "expiration"` を探して期限を取得
@@ -23,8 +36,25 @@ Python 標準ライブラリのみで動作し、追加のパッケージイン�
 ## 動作要件
 
 - Python 3.11 以上
-- 外部ライブラリ不要（標準ライブラリのみ）
+- 外部ライブラリ不要（標準ライブラリのみでも動作します）
 - 対象ホストの 443 番ポートと `rdap.org`（および転送先の RDAP サーバ）へのネットワーク接続
+
+### 推奨: truststore のインストール
+
+```sh
+pip install -r requirements.txt
+# または
+pip install truststore
+```
+
+`truststore` が入っている場合、証明書チェーンの検証に **OS の信頼ストア**
+（Windows なら CryptoAPI、macOS なら Secure Transport の検証基盤）を使うようになります。
+Python 標準の検証は同梱の CA ストアだけを使うため、OS 側では取得できるルート証明書
+（例: Windows での `SSL.com TLS ECC Root CA 2022`）が無いサイトでは
+`unable to get local issuer certificate` で検証に失敗することがあります。
+truststore を使うとブラウザと同じように検証できるため、この種のサイト
+（例: example.com）も正しく検証できます。
+truststore が無い環境では、従来どおり Python の CA ストアで検証します。
 
 ## 使い方
 
@@ -87,7 +117,8 @@ JSON は標準出力に、サマリー行は標準エラー出力に出るため
         "subject_cn": "*.example.com",
         "sans": ["*.example.com", "example.com"],
         "verified": true,
-        "error": null
+        "error": null,
+        "note": null
       },
       "registration": {
         "status": "OK",
@@ -156,7 +187,7 @@ python3 cert_checker.py --file domains.txt || echo "要確認 (exit=$?)"
 python3 -m unittest discover -s tests -v
 ```
 
-テストの対象: 日付パース（証明書形式 / RDAP の ISO 8601 形式）、残り日数とステータス判定、RDAP `events` の解析とエラー処理、証明書情報の抽出、ドメインファイルの解析、終了コード、CLI 出力（テーブル / JSON）。
+テストの対象: 日付パース（証明書形式 / RDAP の ISO 8601 形式）、残り日数とステータス判定、RDAP `events` の解析とエラー処理、証明書情報の抽出、AIA による中間証明書の補完（`caIssuers` の抽出、DER/PEM 変換、再接続の成功・失敗、ホスト名不一致を再試行しないこと）、ドメインファイルの解析、終了コード、CLI 出力（テーブル / JSON）。
 
 ## 現在の制限事項
 
@@ -165,9 +196,13 @@ python3 -m unittest discover -s tests -v
 - 親ドメインへのフォールバックは「先頭のラベルを削る」単純な方式です。Public Suffix List は参照していないため、
   `www.example.co.jp` のようなケースでは正しく登録ドメインを特定できない場合があります。
 - `rdap.org` はブートストラップ用の公開リダイレクタです。大量のドメインを短時間に問い合わせるとレート制限を受ける可能性があります。
-- 証明書チェックは SNI 付きの TLS 接続で、サーバが提示したリーフ証明書のみを確認します（中間証明書の期限は個別にチェックしていません）。
-- 検証に失敗した証明書の内容を読むために、CPython 内部の `ssl._ssl._test_decode_cert` を使用しています。
-  これが使えない Python 実装では、検証失敗時は `ERROR` として報告されます。
+- 証明書チェックは SNI 付きの TLS 接続で、期限を報告するのはリーフ証明書のみです（中間証明書の期限は個別にチェックしていません）。
+- 中間証明書を送らないサーバは AIA で補完しますが、証明書に `caIssuers`（http/https）がない場合や、
+  配布先が PKCS#7（`.p7c`）形式の場合は補完できず、従来どおり検証エラー（`ERROR`）になります。
+  なお、AIA で補完できたサーバでも、AIA に対応しないクライアント（多くの CLI ツールやライブラリ）では検証に失敗するため、
+  サーバ側で中間証明書を送るよう設定を直すことを推奨します（`note` 欄で判別できます）。
+- 検証に失敗した証明書の内容を読むため、および AIA の `caIssuers` を読むために、CPython 内部の `ssl._ssl._test_decode_cert` を使用しています。
+  これが使えない Python 実装では、検証失敗時は `ERROR` として報告され、AIA による補完も行われません。
 - STARTTLS（SMTP/IMAP など）には対応していません。
 
 ## 今後のアイデア
