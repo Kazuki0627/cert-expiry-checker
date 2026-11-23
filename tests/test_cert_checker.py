@@ -351,6 +351,309 @@ def socket_gaierror():
 
 
 # ---------------------------------------------------------------------------
+# AIA chain completion
+# ---------------------------------------------------------------------------
+
+# Test-only certificates (EC P-256). The intermediate is signed by the root and
+# carries AIA caIssuers http://ca.test/root.der and ldap://ca.test/root.
+INT_PEM = """-----BEGIN CERTIFICATE-----
+MIICMTCCAdegAwIBAgIUXIFl1A/0J8onTzVfJ3PfK5ATZ/kwCgYIKoZIzj0EAwIw
+IzENMAsGA1UECgwEVGVzdDESMBAGA1UEAwwJVGVzdCBSb290MCAXDTI2MTEyMzE1
+MzEwMVoYDzIxMjYxMDMwMTUzMTAxWjArMQ0wCwYDVQQKDARUZXN0MRowGAYDVQQD
+DBFUZXN0IEludGVybWVkaWF0ZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABEs1
+Z+3Vomo2lxQByBks6jd6CV67kwkZajb8vxqeEivEUSy4cR9VdeyuSEqKzIdjVBUb
+h1KwRMKGJ/W6maeUbACjgd4wgdswEgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8B
+Af8EBAMCAQYwdQYIKwYBBQUHAQEEaTBnMCMGCCsGAQUFBzAChhdodHRwOi8vY2Eu
+dGVzdC9yb290LmRlcjAfBggrBgEFBQcwAoYTbGRhcDovL2NhLnRlc3Qvcm9vdDAf
+BggrBgEFBQcwAYYTaHR0cDovL29jc3AuY2EudGVzdDAdBgNVHQ4EFgQUEtraq/vB
+XZmDU2ltHfprp/ngsqwwHwYDVR0jBBgwFoAUwPmQ5VinFh9OmLpx3McXCLhPDycw
+CgYIKoZIzj0EAwIDSAAwRQIhAJ3J5qj4KmAPi9e4ylpfj0QME7uPWhHaus+MJ0Kg
+wL9mAiAjq79sDltgxqoPY1ZGAfKzvdWDJFNBF3rDsFS06wAfDA==
+-----END CERTIFICATE-----
+"""
+ROOT_PEM = """-----BEGIN CERTIFICATE-----
+MIIBnTCCAUOgAwIBAgIUa+0ipKDnfktSwHUmUVXp5QQlPHIwCgYIKoZIzj0EAwIw
+IzENMAsGA1UECgwEVGVzdDESMBAGA1UEAwwJVGVzdCBSb290MCAXDTI2MTEyMzE1
+MzEwMVoYDzIxMjYxMDMwMTUzMTAxWjAjMQ0wCwYDVQQKDARUZXN0MRIwEAYDVQQD
+DAlUZXN0IFJvb3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS65//i2txj9HHS
+NpX8ftqRkinxmF6M7ywqzSr7XnJAkU95a2UtYRnKsRCRvczUSf5Ujn9nbSG+0gQc
+3pYY7PEso1MwUTAdBgNVHQ4EFgQUwPmQ5VinFh9OmLpx3McXCLhPDycwHwYDVR0j
+BBgwFoAUwPmQ5VinFh9OmLpx3McXCLhPDycwDwYDVR0TAQH/BAUwAwEB/zAKBggq
+hkjOPQQDAgNIADBFAiA1vMMuwOdeoYols+pBnfNNOSlkOQ6nm8E9AoVi0PX5LQIh
+ANq1M5LJJs2TkqXb5wGfS3Jy64Z5cyINqT7L/IgG1CQc
+-----END CERTIFICATE-----
+"""
+INT_DER = ssl.PEM_cert_to_DER_cert(INT_PEM)
+ROOT_DER = ssl.PEM_cert_to_DER_cert(ROOT_PEM)
+LEAF_DER = b"\x30fake-leaf-der"
+LEAF_AIA = "http://ca.test/intermediate.crt"
+
+_real_decode = cc._decode_der_cert
+
+
+def leaf_with_aia(not_after="Mar  1 12:00:00 2026 GMT"):
+    cert = make_peer_cert(not_after)
+    cert["caIssuers"] = (LEAF_AIA,)
+    return cert
+
+
+def decode_leaf_or_real(der):
+    return leaf_with_aia() if der == LEAF_DER else _real_decode(der)
+
+
+def verify_error(code, message):
+    exc = ssl.SSLCertVerificationError(1, f"[SSL: CERTIFICATE_VERIFY_FAILED] "
+                                          f"certificate verify failed: {message}")
+    exc.verify_code = code
+    exc.verify_message = message
+    return exc
+
+
+def chain_error():
+    return verify_error(20, "unable to get local issuer certificate")
+
+
+class AiaResponse:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def read(self, n=-1):
+        return self._body if n is None or n < 0 else self._body[:n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestExtractCaIssuers(unittest.TestCase):
+    def test_extracts_http_and_https_only(self):
+        cert = {"caIssuers": ("http://a.test/ca.crt", "ldap://b.test/ca", "https://c.test/ca.der",
+                              "file:///etc/passwd", "http://a.test/ca.crt", "  HTTP://d.test/x ")}
+        self.assertEqual(cc.extract_ca_issuers(cert),
+                         ["http://a.test/ca.crt", "https://c.test/ca.der", "HTTP://d.test/x"])
+
+    def test_missing_or_malformed(self):
+        for cert in [{}, {"caIssuers": None}, {"caIssuers": (1, None)}, None, "x"]:
+            with self.subTest(cert=cert):
+                self.assertEqual(cc.extract_ca_issuers(cert), [])
+
+    def test_from_real_decoded_cert(self):
+        decoded = _real_decode(INT_DER)
+        self.assertEqual(cc.extract_ca_issuers(decoded), ["http://ca.test/root.der"])
+
+
+class TestAiaDownload(unittest.TestCase):
+    def test_der_converted_to_pem(self):
+        pem = cc.cert_bytes_to_pem(INT_DER)
+        self.assertTrue(pem.startswith("-----BEGIN CERTIFICATE-----"))
+        self.assertEqual(ssl.PEM_cert_to_DER_cert(pem), INT_DER)
+
+    def test_pem_accepted(self):
+        pem = cc.cert_bytes_to_pem(b"junk before\n" + INT_PEM.encode() + ROOT_PEM.encode())
+        self.assertEqual(ssl.PEM_cert_to_DER_cert(pem), INT_DER)  # first block only
+
+    def test_garbage_rejected(self):
+        for bad in [b"", b"<html>not a cert</html>", b"-----BEGIN CERTIFICATE-----\nabc"]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    cc.cert_bytes_to_pem(bad)
+
+    def test_download_der(self):
+        with mock.patch.object(cc, "_open_aia_url", return_value=AiaResponse(INT_DER)) as m:
+            pem = cc.download_ca_issuer("http://ca.test/int.crt", timeout=3)
+        m.assert_called_once_with("http://ca.test/int.crt", 3)
+        self.assertEqual(ssl.PEM_cert_to_DER_cert(pem), INT_DER)
+
+    def test_download_size_capped(self):
+        big = INT_DER + b"\x00" * cc.AIA_MAX_BYTES
+        with mock.patch.object(cc, "_open_aia_url", return_value=AiaResponse(big)):
+            with self.assertRaises(ValueError):
+                cc.download_ca_issuer("http://ca.test/int.crt")
+
+    def test_non_http_scheme_not_fetched(self):
+        with mock.patch.object(cc, "_open_aia_url") as m:
+            with self.assertRaises(ValueError):
+                cc.download_ca_issuer("file:///etc/passwd")
+        m.assert_not_called()
+
+    def test_aia_context_disables_partial_chain(self):
+        ctx = cc._aia_context([INT_PEM])
+        self.assertTrue(ctx.check_hostname)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+        partial = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+        self.assertFalse(ctx.verify_flags & partial)
+
+
+class TestIsChainError(unittest.TestCase):
+    def test_chain_errors(self):
+        for code, msg in [(20, "unable to get local issuer certificate"),
+                          (21, "unable to verify the first certificate"),
+                          (2, "unable to get issuer certificate"),
+                          (19, "self-signed certificate in certificate chain"),
+                          (None, "unable to get local issuer certificate")]:
+            with self.subTest(code=code):
+                self.assertTrue(cc.is_chain_error(verify_error(code, msg)))
+
+    def test_non_chain_errors(self):
+        for code, msg in [(62, "Hostname mismatch, certificate is not valid for 'x.test'."),
+                          (10, "certificate has expired"),
+                          (18, "self-signed certificate"),
+                          (None, "Hostname mismatch, certificate is not valid for 'x'.")]:
+            with self.subTest(code=code):
+                self.assertFalse(cc.is_chain_error(verify_error(code, msg)))
+
+
+class TestAiaFetchPeerCert(unittest.TestCase):
+    """fetch_peer_cert / check_cert with all network I/O mocked."""
+
+    def _patches(self, verify_side_effect, open_side_effect=None, open_return=None):
+        return [
+            mock.patch.object(cc, "_get_verified_cert", side_effect=verify_side_effect),
+            mock.patch.object(cc, "_get_unverified_der", return_value=LEAF_DER),
+            mock.patch.object(cc, "_decode_der_cert", side_effect=decode_leaf_or_real),
+            mock.patch.object(cc, "_open_aia_url", side_effect=open_side_effect,
+                              return_value=open_return),
+        ]
+
+    def _run(self, patches, fn):
+        mocks = [p.start() for p in patches]
+        try:
+            return fn(), mocks
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_retry_success(self):
+        verified_cert = leaf_with_aia("Dec 31 00:00:00 2026 GMT")
+        patches = self._patches([chain_error(), verified_cert],
+                                open_side_effect=lambda url, t: AiaResponse(INT_DER))
+        result, (verify, _, _, opener) = self._run(
+            patches, lambda: cc.fetch_peer_cert("example.com", 443, 7))
+        cert, verified, err, note = result
+        self.assertIs(cert, verified_cert)
+        self.assertTrue(verified)
+        self.assertIsNone(err)
+        self.assertIn(cc.AIA_NOTE, note)
+        opener.assert_called_once_with(LEAF_AIA, 7)
+        self.assertEqual(verify.call_count, 2)
+        retry_ctx = verify.call_args.args[3]
+        self.assertTrue(retry_ctx.check_hostname)  # hostname still verified on retry
+        self.assertEqual(verify.call_args.args[:3], ("example.com", 443, 7))
+
+    def test_check_cert_reports_verified_with_note(self):
+        patches = self._patches([chain_error(), make_peer_cert()],
+                                open_side_effect=lambda url, t: AiaResponse(INT_PEM.encode()))
+        info, _ = self._run(patches, lambda: cc.check_cert("example.com", now=NOW))
+        self.assertEqual(info.status, cc.OK)
+        self.assertTrue(info.verified)
+        self.assertIsNone(info.error)
+        self.assertIn(cc.AIA_NOTE, info.note)
+
+    def test_aia_success_still_reports_expiry_status(self):
+        patches = self._patches([chain_error(), make_peer_cert()],
+                                open_side_effect=lambda url, t: AiaResponse(INT_DER))
+        info, _ = self._run(patches, lambda: cc.check_cert("example.com", warn_days=60, now=NOW))
+        self.assertEqual(info.status, cc.WARNING)
+        self.assertTrue(info.verified)
+
+    def test_fetch_failure_falls_back_to_original_error(self):
+        for exc in [urllib.error.URLError("no route"), TimeoutError(), OSError("boom")]:
+            with self.subTest(exc=type(exc).__name__):
+                patches = self._patches([chain_error()], open_side_effect=exc)
+                info, (verify, _, _, opener) = self._run(
+                    patches, lambda: cc.check_cert("example.com", now=NOW))
+                self.assertEqual(info.status, cc.ERROR)
+                self.assertFalse(info.verified)
+                self.assertIn("unable to get local issuer certificate", info.error)
+                self.assertIsNone(info.note)
+                self.assertEqual(info.days_remaining, 59)  # expiry still shown
+                self.assertEqual(verify.call_count, 1)
+
+    def test_unparseable_download_falls_back(self):
+        patches = self._patches([chain_error()],
+                                open_side_effect=lambda url, t: AiaResponse(b"<html>404</html>"))
+        result, (verify, *_) = self._run(patches, lambda: cc.fetch_peer_cert("example.com"))
+        self.assertEqual(result[1:], (False, "unable to get local issuer certificate"))
+        self.assertEqual(verify.call_count, 1)
+
+    def test_retry_still_failing_falls_back(self):
+        # INT's caIssuers points to the self-signed root, which must not be loaded.
+        def fake_open(url, timeout):
+            return AiaResponse(INT_DER if url == LEAF_AIA else ROOT_DER)
+
+        patches = self._patches([chain_error(), chain_error()], open_side_effect=fake_open)
+        result, (verify, _, _, opener) = self._run(
+            patches, lambda: cc.fetch_peer_cert("example.com"))
+        self.assertEqual(result[1:], (False, "unable to get local issuer certificate"))
+        self.assertEqual(verify.call_count, 2)
+        self.assertEqual([c.args[0] for c in opener.call_args_list],
+                         [LEAF_AIA, "http://ca.test/root.der"])
+
+    def test_follows_at_most_three_intermediates(self):
+        counter = iter(range(100))
+
+        def fake_decode(der):
+            if der == LEAF_DER:
+                return leaf_with_aia()
+            n = next(counter)
+            return {"subject": ((("commonName", f"I{n}"),),),
+                    "issuer": ((("commonName", f"I{n + 1}"),),),
+                    "caIssuers": (f"http://ca.test/{n + 1}.crt",)}
+
+        def always_chain_error(*args):
+            raise chain_error()
+
+        with mock.patch.object(cc, "_get_verified_cert",
+                               side_effect=always_chain_error) as verify, \
+             mock.patch.object(cc, "_get_unverified_der", return_value=LEAF_DER), \
+             mock.patch.object(cc, "_decode_der_cert", side_effect=fake_decode), \
+             mock.patch.object(cc, "_open_aia_url",
+                               side_effect=lambda u, t: AiaResponse(INT_DER)) as opener:
+            result = cc.fetch_peer_cert("example.com")
+        self.assertFalse(result[1])
+        self.assertEqual(opener.call_count, 3)
+        self.assertEqual(verify.call_count, 1 + 3)
+
+    def test_retry_reveals_more_specific_error(self):
+        patches = self._patches([chain_error(), verify_error(10, "certificate has expired")],
+                                open_side_effect=lambda url, t: AiaResponse(INT_DER))
+        result, _ = self._run(patches, lambda: cc.fetch_peer_cert("example.com"))
+        self.assertEqual(result[1:], (False, "certificate has expired"))
+
+    def test_hostname_mismatch_not_retried(self):
+        err = verify_error(62, "Hostname mismatch, certificate is not valid for 'example.com'.")
+        patches = self._patches([err])
+        info, (verify, _, _, opener) = self._run(
+            patches, lambda: cc.check_cert("example.com", now=NOW))
+        opener.assert_not_called()
+        self.assertEqual(verify.call_count, 1)
+        self.assertEqual(info.status, cc.ERROR)
+        self.assertIn("Hostname mismatch", info.error)
+        self.assertIsNone(info.note)
+
+    def test_self_signed_and_expired_not_retried(self):
+        for code, msg, status in [(18, "self-signed certificate", cc.ERROR),
+                                  (10, "certificate has expired", cc.ERROR)]:
+            with self.subTest(msg=msg):
+                patches = self._patches([verify_error(code, msg)])
+                info, (verify, _, _, opener) = self._run(
+                    patches, lambda: cc.check_cert("example.com", now=NOW))
+                opener.assert_not_called()
+                self.assertEqual(verify.call_count, 1)
+                self.assertEqual(info.status, status)
+                self.assertFalse(info.verified)
+
+    def test_note_in_table_and_json(self):
+        r = cc.CheckResult(domain="example.com", status=cc.OK)
+        r.cert = cc.CertInfo(status=cc.OK, verified=True, note="chain completed via AIA")
+        self.assertIn("cert: chain completed via AIA", cc.format_table([r]))
+        self.assertEqual(r.to_dict()["cert"]["note"], "chain completed via AIA")
+        self.assertIn("error", r.to_dict()["cert"])
+
+
+# ---------------------------------------------------------------------------
 # Orchestration, input parsing, exit codes, CLI
 # ---------------------------------------------------------------------------
 
@@ -482,6 +785,27 @@ class TestCli(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             self._run([])
         self.assertEqual(ctx.exception.code, 2)
+
+
+class TestCreateVerifyContext(unittest.TestCase):
+    def test_returns_ssl_context(self):
+        ctx = cc.create_verify_context()
+        self.assertIsInstance(ctx, ssl.SSLContext)
+        self.assertTrue(ctx.check_hostname)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_fallback_without_truststore(self):
+        with mock.patch.object(cc, "_truststore", None):
+            ctx = cc.create_verify_context()
+        self.assertIsInstance(ctx, ssl.SSLContext)
+        self.assertTrue(ctx.check_hostname)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_uses_truststore_when_available(self):
+        if cc._truststore is None:
+            self.skipTest("truststore is not installed")
+        ctx = cc.create_verify_context()
+        self.assertIsInstance(ctx, cc._truststore.SSLContext)
 
 
 if __name__ == "__main__":
